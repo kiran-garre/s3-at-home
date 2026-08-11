@@ -1,0 +1,1 @@
+Given a key+value pair, I want to write it to disk.
