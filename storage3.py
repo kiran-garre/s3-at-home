@@ -19,8 +19,11 @@ class Blob:
 		pass
 
 """
-A block-based approach, where a single blob maps to one or more blocks. There
-are a fixed number of blocks, and each block is one of many fixed sizes.
+A block-based approach, where a single blob maps to one or more blocks. Blocks 
+are split through partitioning, and smaller blocks are combined into
+bigger blocks through coalescing. Allocated blocks are always as large as 
+possible under the blob size (or remaining size) until the minimum block size
+is reached.
 
 Operations:
 - Insert
@@ -33,7 +36,7 @@ class Chunk:
 	size: int
 	offset: int
 
-class Storage2:
+class Storage3:
 	def __init__(self, disk_filename):
 		self.handle = open(disk_filename, "a+b")
 		# key -> (size, list of chunks)
@@ -41,29 +44,26 @@ class Storage2:
 		# chunk size -> list of free chunks of that size
 		self.free_map: dict[int: list[Chunk]] = defaultdict(list)
 
-		# ----- Build free list -----
-
 		MIN_CHUNK_POWER = 10 # 1KiB
-		MAX_CHUNK_POWER = 15 # 32KiB
-		self.CHUNK_SIZES = [2**n for n in range(MIN_CHUNK_POWER, MAX_CHUNK_POWER + 1)]
-		disk_size = os.path.getsize(disk_filename)
-		
-		# Let each block size take up at most 0.5 of the remaining available disk space
-		# Fill the remaining with minimum chunk size blocks
-		THRESHOLD_PCT = 0.5
-		tracked_space = 0
-		threshold = THRESHOLD_PCT * disk_size
-		
-		for size in reversed(self.CHUNK_SIZES):
-			while (
-				tracked_space + size < threshold
-				or (size == self.CHUNK_SIZES[0] and tracked_space < disk_size) 
-			):
-				self.free_map[size].append(Chunk(size, tracked_space))
-				tracked_space += size
-			threshold = THRESHOLD_PCT * (disk_size - tracked_space)
+		max_chunk_power = os.path.getsize(disk_filename).bit_length - 1
+		if max_chunk_power < MIN_CHUNK_POWER:
+			raise ValueError("how you gonna store blobs in such a tiny file")
+		self.chunk_sizes = [2**n for n in range(MIN_CHUNK_POWER, max_chunk_power + 1)]
 
+		max_size = self.chunk_sizes[-1]
+		self.free_map[max_size].append(Chunk(max_size, 0))
+
+	def partition_chunk(chunk: Chunk) -> tuple[Chunk, Chunk]:
+		size, offset = chunk.size, chunk.offset
+		new_size = size // 2
+		return Chunk(new_size, offset), Chunk(new_size, offset + new_size)
 	
+	def coalesce_chunks(chunk1: Chunk, chunk2: Chunk) -> Chunk:
+		# This function assumes chunk1 and chunk2 are contiguous and ordered
+		if chunk1.size != chunk2.size:
+			raise ValueError("Attempted to coalesce chunks of different sizes")
+		return Chunk(chunk1.size + chunk2.size, chunk1.offset)
+
 	def insert(self, key, blob):
 		# For any blob, we want to grab the largest chunk 
 		# such that remaining blob size > size of chunk
