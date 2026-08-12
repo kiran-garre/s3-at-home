@@ -1,6 +1,6 @@
 import os
 from collections import deque, defaultdict
-from typing import Self
+from typing import Any, Self
 from dataclasses import dataclass
 
 class Blob:
@@ -20,7 +20,7 @@ class Blob:
 
 """
 A block-based approach, where a single blob maps to one or more blocks. Blocks 
-are split through partitioning, and smaller blocks are combined into
+are split through partitioning, and contiguous blocks are combined into
 bigger blocks through coalescing. Allocated blocks are always as large as 
 possible under the blob size (or remaining size) until the minimum block size
 is reached.
@@ -31,69 +31,148 @@ Operations:
 - Delete
 """
 
+def ceil_log(n: int):
+	if n == 1:
+		return 0
+	return (n - 1).bit_length()
+
+def floor_log(n: int):
+	return n.bit_length() - 1
+
 @dataclass
 class Chunk:
 	size: int
 	offset: int
 
+ZERO_CHUNK = Chunk(0, 0)
+
+def partition(chunk: Chunk, min_size: int) -> tuple[Chunk, Chunk]:
+	size, offset = chunk.size, chunk.offset
+	new_size = size // 2
+	if new_size < min_size:
+		return chunk, ZERO_CHUNK
+	return Chunk(new_size, offset), Chunk(new_size, offset + new_size)
+
+	
+def coalesce(chunks: list[Chunk], min_size, max_size) -> list[Chunk]:
+	# Assumes the chunks are ordered and contiguous
+	offset = chunks[0].offset
+	new_chunks = []
+	remaining_size = sum([chunk.size for chunk in chunks])
+	
+	while remaining_size > 0:
+		if remaining_size < min_size:
+			print(f"warning: unexpected fragmentation of {remaining_size} bytes")
+			break
+		new_chunk_size = min(2**floor_log(remaining_size), max_size)
+		new_chunks.append(Chunk(new_chunk_size, offset))
+		offset += new_chunk_size
+		remaining_size -= new_chunk_size
+
+	if remaining_size < 0:
+		raise RuntimeError(f"overallocation of {remaining_size} bytes")
+	
+	return new_chunks
+
+
+def fit_big_chunk(size, big_chunk: Chunk, min_chunk_size: int) -> tuple[list[Chunk], list[Chunk]]:
+	allocated_chunks = []
+	free_chunks = []
+	
+	def recurse(size, chunk):
+		nonlocal allocated_chunks, free_chunks, min_chunk_size
+		if chunk.size <= 0:
+			return size
+		if size <= 0:
+			free_chunks.append(chunk)
+			return -1
+		if chunk.size == min_chunk_size or chunk.size <= size:
+			allocated_chunks.append(chunk)
+			return size - chunk.size
+		
+		# Keep partitioning if our blocks are too big (and if we can)
+		chunk1, chunk2 = partition(chunk, min_chunk_size)
+		remaining = recurse(size, chunk1)
+		remaining = recurse(remaining, chunk2)
+		return remaining
+		
+	recurse(size, big_chunk)
+	return allocated_chunks, free_chunks
+
+
 class Storage3:
 	def __init__(self, disk_filename):
 		self.handle = open(disk_filename, "a+b")
 		# key -> (size, list of chunks)
-		self.blob_map: dict[any: tuple[int, list[Chunk]]] = defaultdict(tuple)
-		# chunk size -> list of free chunks of that size
+		self.blob_map: dict[Any, tuple[int, list[Chunk]]] = defaultdict(tuple)
+		# log2(chunk size) -> list of free chunks of that size
 		self.free_map: dict[int: list[Chunk]] = defaultdict(list)
 
 		MIN_CHUNK_POWER = 10 # 1KiB
 		max_chunk_power = os.path.getsize(disk_filename).bit_length - 1
 		if max_chunk_power < MIN_CHUNK_POWER:
 			raise ValueError("how you gonna store blobs in such a tiny file")
-		self.chunk_sizes = [2**n for n in range(MIN_CHUNK_POWER, max_chunk_power + 1)]
+		self.chunk_powers = list(range(MIN_CHUNK_POWER, max_chunk_power + 1))
+		self.chunk_sizes = [2**n for n in self.chunk_power]
 
-		max_size = self.chunk_sizes[-1]
-		self.free_map[max_size].append(Chunk(max_size, 0))
+		self.MIN_CHUNK_POWER = MIN_CHUNK_POWER
+		self.max_chunk_power = max_chunk_power
 
-	def partition_chunk(chunk: Chunk) -> tuple[Chunk, Chunk]:
-		size, offset = chunk.size, chunk.offset
-		new_size = size // 2
-		return Chunk(new_size, offset), Chunk(new_size, offset + new_size)
-	
-	def coalesce_chunks(chunk1: Chunk, chunk2: Chunk) -> Chunk:
-		# This function assumes chunk1 and chunk2 are contiguous and ordered
-		if chunk1.size != chunk2.size:
-			raise ValueError("Attempted to coalesce chunks of different sizes")
-		return Chunk(chunk1.size + chunk2.size, chunk1.offset)
+		max_size = 2**max_chunk_power
+		self.free_map[max_chunk_power].append(Chunk(max_size, 0))
+
 
 	def insert(self, key, blob):
-		# For any blob, we want to grab the largest chunk 
-		# such that remaining blob size > size of chunk
-		# If there are none, this means the remaining blob size is smaller than
-		# all available chunks. Therefore, the minimum sized free chunk is the
-		# closest to the remaining blob size (lowest fragmentation).
+		allocated_chunks = self.get_chunks(blob.size)
+		self.write_chunks(blob, allocated_chunks)
+		self.blob_map[key] = (blob.size, allocated_chunks)
+		
+				
+	def get_chunks(self, size) -> list[Chunk]:
+		# Consider the case where we have a 6KB blob, and we have a single free 8KB and six free 1KB blocks. 
+		# Then, the largest blocks that are smaller than the blob are the 1KB blocks, but the better solution
+		# would be to partition the 8KB block into an allocated 6KB (4KB + 2KB) and a leftover 2KB block.
+		# 
+		# Therefore, the cleanest solution is actually to prioritize looking for the smallest block that
+		# is larger than the blob (or whatever's left), partitioning it, coalescing the leftovers,
+		# and recursing.
+		#
+		# Then, only once this fails (meaning there are no larger blocks) do we look for smaller blocks.
+		# There's no reason to partition in this case, so we try to find the largest block that is smaller 
+		# than the remaining blob size (recursively if needed).
 
-		# Separate chunk size calculation from actual writing. We don't want to
-		# reach the end and then realize we don't have the right sized chunks
-		chunks = []
-		remaining = blob.size
-		for size in reversed(self.CHUNK_SIZES):
-			while remaining > size and self.free_map[size]:
-				chunks.append(self.free_map[size].pop())
-				remaining -= size
-		if remaining:
-			for size in self.CHUNK_SIZES:
-				if self.free_map[size]:
-					chunks.append(self.free_map[size].pop())
-					self.write_chunks(blob, chunks)
-					self.blob_map[key] = (size, chunks)
-					return 0
-				print("Failed to insert object")
-				return 1
-	
+		allocated_chunks = []
+		free_chunks = []
+		for power in range(ceil_log(size), max(self.chunk_powers) + 1):
+			if self.free_map[power]:
+				big_chunk = self.free_map[power].pop()
+				allocated_chunks, free_chunks = fit_big_chunk(size, big_chunk, 2**self.MIN_CHUNK_POWER)
+			
+		if not allocated_chunks:
+			remaining = size
+			allocated_chunks = []
+			for power in range(ceil_log(size) - 1, self.MIN_CHUNK_POWER - 1, -1):
+				chunk_size = 2**power
+				while remaining > chunk_size and self.free_map[power]:
+					allocated_chunks.append(self.free_map[size].pop())
+					remaining -= chunk_size
+			if remaining > 0:
+				return None
+		
+		allocated_chunks = coalesce(allocated_chunks)
+		free_chunks = coalesce(free_chunks)
+		for chunk in free_chunks:
+			self.free_map[chunk.size.bit_length() - 1].append(chunk)
+
+		return allocated_chunks
+
+
 	def write_chunks(self, blob: Blob, allocated_chunks: list[Chunk]):
 		for chunk in allocated_chunks:
 			data_chunk = blob.get_chunk(chunk.size)
 			self.handle.seek(chunk.offset)
 			self.handle.write(data_chunk)
+
 
 	def fetch(self, key) -> Blob:
 		read_chunks = []
@@ -104,12 +183,14 @@ class Storage3:
 		blob = Blob.from_data_chunks(read_chunks)
 		blob.truncate(size)
 		return blob
+	
 		
 	def delete(self, key):
 		_, chunks = self.blob_map[key]
 		for chunk in chunks:
 			self.free_map[chunk.size].append(chunk)
 		del self.blob_map[key]
+
 
 	def close(self):
 		self.handle.close()
