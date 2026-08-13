@@ -2,21 +2,7 @@ import os
 from collections import deque, defaultdict
 from typing import Self
 from dataclasses import dataclass
-
-class Blob:
-	def __init__(self, size):
-		self.size = size
-
-	def get_chunk(self, chunk_size: int) -> Self: # maybe blob, maybe bytes, doesn't matter for now
-		# generator
-		pass
-	
-	def truncate(self) -> None:
-		pass
-
-	@staticmethod
-	def from_data_chunks(chunks: list[Self]) -> Self:
-		pass
+from blob import Blob
 
 """
 A block-based approach, where a single blob maps to one or more blocks. There
@@ -35,7 +21,7 @@ class Chunk:
 
 class Storage2:
 	def __init__(self, disk_filename):
-		self.handle = open(disk_filename, "a+b")
+		self.handle = open(disk_filename, "r+b")
 		# key -> (size, list of chunks)
 		self.blob_map: dict[any: tuple[int, list[Chunk]]] = defaultdict(tuple)
 		# chunk size -> list of free chunks of that size
@@ -65,6 +51,8 @@ class Storage2:
 
 	
 	def insert(self, key, blob):
+		if key in self.blob_map:
+			return
 		# For any blob, we want to grab the largest chunk 
 		# such that remaining blob size > size of chunk
 		# If there are none, this means the remaining blob size is smaller than
@@ -96,6 +84,8 @@ class Storage2:
 			self.handle.write(data_chunk)
 
 	def fetch(self, key) -> Blob:
+		if key not in self.chunk_map:
+			return None
 		read_chunks = []
 		size, disk_chunks = self.blob_map[key]
 		for disk_chunk in disk_chunks:
@@ -106,6 +96,8 @@ class Storage2:
 		return blob
 		
 	def delete(self, key):
+		if key not in self.chunk_map:
+			return
 		_, chunks = self.blob_map[key]
 		for chunk in chunks:
 			self.free_map[chunk.size].append(chunk)

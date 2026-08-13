@@ -1,29 +1,8 @@
 import os
 from collections import deque, defaultdict
-from typing import Any, Self
+from typing import Any
 from dataclasses import dataclass
-
-class Blob:
-	def __init__(self, size, data: bytes):
-		self.size = size
-		self.data = data
-		self.offset = 0
-
-	def get_chunk(self, chunk_size: int) -> memoryview: # maybe blob, maybe bytes, doesn't matter for now
-		data = None
-		if offset < self.size:
-			data = memoryview(self.data)[offset : offset + chunk_size]
-			offset += chunk_size
-		return data
-		
-	def truncate(self, new_size) -> None:
-		self.data = self.data[:new_size]
-
-	@staticmethod
-	def from_data_chunks(chunks: list[memoryview]) -> Self:
-		data = b"".join(bytes(m) for m in chunks)
-		return Blob(data.__sizeof__(), data)
-
+from blob import Blob
 
 """
 A block-based approach, where a single blob maps to one or more blocks. Blocks 
@@ -130,6 +109,8 @@ class Storage3:
 
 
 	def insert(self, key, blob):
+		if key in self.blob_map:
+			return
 		allocated_chunks = self.get_chunks(blob.size)
 		self.write_chunks(blob, allocated_chunks)
 		self.blob_map[key] = (blob.size, allocated_chunks)
@@ -182,6 +163,8 @@ class Storage3:
 
 
 	def fetch(self, key) -> Blob:
+		if key not in self.chunk_map:
+			return None
 		read_chunks = []
 		size, disk_chunks = self.blob_map[key]
 		for disk_chunk in disk_chunks:
@@ -193,6 +176,8 @@ class Storage3:
 	
 		
 	def delete(self, key):
+		if key not in self.chunk_map:
+			return
 		_, chunks = self.blob_map[key]
 		for chunk in chunks:
 			self.free_map[chunk.size].append(chunk)

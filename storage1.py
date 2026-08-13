@@ -1,20 +1,9 @@
 import os
 from collections import deque, defaultdict
 from typing import Self
+from blob import Blob
+from storage_error import *
 
-class Blob:
-	def __init__(self, size):
-		self.size = size
-
-	def chunkify(self, chunk_size) -> list[Self]: # maybe blob, maybe bytes, doesn't matter for now
-		pass
-	
-	def truncate(self) -> None:
-		pass
-
-	@staticmethod
-	def from_chunks(chunks):
-		pass
 
 """
 A block-based approach, where a single blob maps to one or more fixed-size blocks.
@@ -65,37 +54,42 @@ CHUNKS = 1
 
 class Storage1:
 	def __init__(self, disk_filename):
-		self.handle = open(disk_filename, "a+b")
+		self.handle = open(disk_filename, "r+b")
 
 		self.CHUNK_SIZE = 512
-		self.chunk_map: dict[any: (int, list[int])] = defaultdict(list)
+		self.blob_map: dict[any, (int, list[int])] = defaultdict(lambda: (0, []))
 		self.free_list = deque(range(0, os.path.getsize(disk_filename), self.CHUNK_SIZE))
 	
 	def insert(self, key, blob):
-		chunks = blob.chunkify()
+		if key in self.blob_map:
+			return None
+		chunks = blob.chunkify(self.CHUNK_SIZE)
 		if len(chunks) > len(self.free_list):
-			return
+			return StorageError(OUT_OF_SPACE, "out of space")
+		offsets = []
 		for i in range(len(chunks)):
 			offset = self.free_list.popleft()
 			self.handle.seek(offset)
 			self.handle.write(chunks[i])
-			self.chunk_map[key][CHUNKS].append(offset)
-		self.chunk_map[key][SIZE] = blob.size
+			offsets.append(offset)
+		self.blob_map[key] = (blob.size, offsets)
 		
-	def fetch(self, key):
+	def fetch(self, key) -> Blob:
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		chunks = []
-		size, offsets = self.chunk_map[key]
+		size, offsets = self.blob_map[key]
 		for offset in offsets:
 			self.handle.seek(offset)
 			chunks.append(self.handle.read(self.CHUNK_SIZE))
-		blob = Blob.from_chunks(chunks)
+		blob = Blob.from_data_chunks(chunks)
 		blob.truncate(size)
 		return blob
 		
 	def delete(self, key):
-		for offset in self.chunk_map[key][CHUNKS]:
+		for offset in self.blob_map[key][CHUNKS]:
 			self.free_list.append(offset)
-		del self.chunk_map[key]
+		del self.blob_map[key]
 
 	def close(self):
 		self.handle.close()
