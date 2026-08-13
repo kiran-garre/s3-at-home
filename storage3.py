@@ -4,19 +4,26 @@ from typing import Any, Self
 from dataclasses import dataclass
 
 class Blob:
-	def __init__(self, size):
+	def __init__(self, size, data: bytes):
 		self.size = size
+		self.data = data
+		self.offset = 0
 
-	def get_chunk(self, chunk_size: int) -> Self: # maybe blob, maybe bytes, doesn't matter for now
-		# generator
-		pass
-	
-	def truncate(self) -> None:
-		pass
+	def get_chunk(self, chunk_size: int) -> memoryview: # maybe blob, maybe bytes, doesn't matter for now
+		data = None
+		if offset < self.size:
+			data = memoryview(self.data)[offset : offset + chunk_size]
+			offset += chunk_size
+		return data
+		
+	def truncate(self, new_size) -> None:
+		self.data = self.data[:new_size]
 
 	@staticmethod
-	def from_data_chunks(chunks: list[Self]) -> Self:
-		pass
+	def from_data_chunks(chunks: list[memoryview]) -> Self:
+		data = b"".join(bytes(m) for m in chunks)
+		return Blob(data.__sizeof__(), data)
+
 
 """
 A block-based approach, where a single blob maps to one or more blocks. Blocks 
@@ -102,7 +109,7 @@ def fit_big_chunk(size, big_chunk: Chunk, min_chunk_size: int) -> tuple[list[Chu
 
 class Storage3:
 	def __init__(self, disk_filename):
-		self.handle = open(disk_filename, "a+b")
+		self.handle = open(disk_filename, "r+b")
 		# key -> (size, list of chunks)
 		self.blob_map: dict[Any, tuple[int, list[Chunk]]] = defaultdict(tuple)
 		# log2(chunk size) -> list of free chunks of that size
