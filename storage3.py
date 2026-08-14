@@ -3,6 +3,7 @@ from collections import deque, defaultdict
 from typing import Any
 from dataclasses import dataclass
 from blob import Blob
+from storage_error import *
 
 """
 A block-based approach, where a single blob maps to one or more blocks. Blocks 
@@ -25,7 +26,7 @@ def ceil_log(n: int):
 def floor_log(n: int):
 	return n.bit_length() - 1
 
-@dataclass
+@dataclass(frozen=True)
 class Chunk:
 	size: int
 	offset: int
@@ -38,9 +39,11 @@ def partition(chunk: Chunk, min_size: int) -> tuple[Chunk, Chunk]:
 	if new_size < min_size:
 		return chunk, ZERO_CHUNK
 	return Chunk(new_size, offset), Chunk(new_size, offset + new_size)
-
 	
 def coalesce(chunks: list[Chunk], min_size, max_size) -> list[Chunk]:
+	if not chunks:
+		return []
+	
 	# Assumes the chunks are ordered and contiguous
 	offset = chunks[0].offset
 	new_chunks = []
@@ -58,10 +61,16 @@ def coalesce(chunks: list[Chunk], min_size, max_size) -> list[Chunk]:
 	if remaining_size < 0:
 		raise RuntimeError(f"overallocation of {remaining_size} bytes")
 	
+	# print(f"Coalesced: {list(map(lambda x: x.size, chunks))} -> {list(map(lambda x: x.size, new_chunks))}")
+
 	return new_chunks
 
 
 def fit_big_chunk(size, big_chunk: Chunk, min_chunk_size: int) -> tuple[list[Chunk], list[Chunk]]:
+	if size > big_chunk.size:
+		return
+		
+	# print(f"Partitioning: blob of size {size} -> big chunk of size: {big_chunk.size}")
 	allocated_chunks = []
 	free_chunks = []
 	
@@ -83,6 +92,9 @@ def fit_big_chunk(size, big_chunk: Chunk, min_chunk_size: int) -> tuple[list[Chu
 		return remaining
 		
 	recurse(size, big_chunk)
+	# print(f"Allocated chunk sizes: {list(map(lambda x: x.size, allocated_chunks))}")
+	# print(f"Free chunk sizes: {list(map(lambda x: x.size, free_chunks))}")
+	
 	return allocated_chunks, free_chunks
 
 
@@ -92,26 +104,28 @@ class Storage3:
 		# key -> (size, list of chunks)
 		self.blob_map: dict[Any, tuple[int, list[Chunk]]] = defaultdict(tuple)
 		# log2(chunk size) -> list of free chunks of that size
-		self.free_map: dict[int: list[Chunk]] = defaultdict(list)
+		self.free_map: dict[int: list[Chunk]] = defaultdict(set)
 
-		MIN_CHUNK_POWER = 10 # 1KiB
-		max_chunk_power = os.path.getsize(disk_filename).bit_length - 1
+		MIN_CHUNK_POWER = 9 # 512B
+		max_chunk_power = os.path.getsize(disk_filename).bit_length() - 1
 		if max_chunk_power < MIN_CHUNK_POWER:
 			raise ValueError("how you gonna store blobs in such a tiny file")
-		self.chunk_powers = list(range(MIN_CHUNK_POWER, max_chunk_power + 1))
-		self.chunk_sizes = [2**n for n in self.chunk_power]
 
 		self.MIN_CHUNK_POWER = MIN_CHUNK_POWER
 		self.max_chunk_power = max_chunk_power
 
 		max_size = 2**max_chunk_power
-		self.free_map[max_chunk_power].append(Chunk(max_size, 0))
+		self.free_map[max_chunk_power].add(Chunk(max_size, 0))
 
+	def coalesce(self, chunks: list[Chunk]) -> list[Chunk]:
+		return coalesce(chunks, 2**self.MIN_CHUNK_POWER, 2**self.max_chunk_power)
 
 	def insert(self, key, blob):
 		if key in self.blob_map:
 			return
 		allocated_chunks = self.get_chunks(blob.size)
+		if not allocated_chunks:
+			return StorageError(OUT_OF_SPACE, "out of space")
 		self.write_chunks(blob, allocated_chunks)
 		self.blob_map[key] = (blob.size, allocated_chunks)
 		
@@ -131,40 +145,61 @@ class Storage3:
 
 		allocated_chunks = []
 		free_chunks = []
-		for power in range(ceil_log(size), max(self.chunk_powers) + 1):
-			if self.free_map[power]:
-				big_chunk = self.free_map[power].pop()
-				allocated_chunks, free_chunks = fit_big_chunk(size, big_chunk, 2**self.MIN_CHUNK_POWER)
+
+		def look_for_and_fit_big_chunk(size):
+			for power in range(ceil_log(size), self.max_chunk_power + 1):
+				if self.free_map[power]:
+					big_chunk = self.free_map[power].pop()
+					return fit_big_chunk(size, big_chunk, 2**self.MIN_CHUNK_POWER)
+			return [], []
+
+		allocated_chunks, free_chunks = look_for_and_fit_big_chunk(size)
 			
-		if not allocated_chunks:
+		if allocated_chunks:
+			allocated_chunks = self.coalesce(allocated_chunks)
+			free_chunks = self.coalesce(free_chunks)
+		else:
 			remaining = size
-			allocated_chunks = []
-			for power in range(ceil_log(size) - 1, self.MIN_CHUNK_POWER - 1, -1):
+			for power in range(floor_log(size), self.MIN_CHUNK_POWER - 1, -1):
 				chunk_size = 2**power
-				while remaining > chunk_size and self.free_map[power]:
-					allocated_chunks.append(self.free_map[size].pop())
+				while remaining >= chunk_size and self.free_map[power]:
+					allocated_chunks.append(self.free_map[power].pop())
 					remaining -= chunk_size
+					if remaining < chunk_size:
+						a, f = look_for_and_fit_big_chunk(remaining)
+						if a:
+							a = self.coalesce(a)
+							f = self.coalesce(f)
+							allocated_chunks.extend(a)
+							free_chunks.extend(f)
+							remaining = 0
+							break
 			if remaining > 0:
-				return None
+				return []
 		
-		allocated_chunks = coalesce(allocated_chunks)
-		free_chunks = coalesce(free_chunks)
+		
 		for chunk in free_chunks:
-			self.free_map[chunk.size.bit_length() - 1].append(chunk)
+			self.free_map[floor_log(chunk.size)].add(chunk)
 
 		return allocated_chunks
-
+	
 
 	def write_chunks(self, blob: Blob, allocated_chunks: list[Chunk]):
+		# print(f"writing blob of size {blob.size}")
 		for chunk in allocated_chunks:
+			# print(chunk)
+			temp = blob.offset
 			data_chunk = blob.get_chunk(chunk.size)
+			# print(f"{temp} -> {blob.offset}")
 			self.handle.seek(chunk.offset)
 			self.handle.write(data_chunk)
+		# print()
+		blob.reset_chunk_generator()
 
 
 	def fetch(self, key) -> Blob:
-		if key not in self.chunk_map:
-			return None
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		read_chunks = []
 		size, disk_chunks = self.blob_map[key]
 		for disk_chunk in disk_chunks:
@@ -176,11 +211,22 @@ class Storage3:
 	
 		
 	def delete(self, key):
-		if key not in self.chunk_map:
-			return
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		_, chunks = self.blob_map[key]
 		for chunk in chunks:
-			self.free_map[chunk.size].append(chunk)
+			s = self.free_map[floor_log(chunk.size)]
+			before = Chunk(chunk.size, chunk.offset - chunk.size)
+			after = Chunk(chunk.size, chunk.offset + chunk.size)
+			if before in s:
+				for coalesced_chunk in self.coalesce([before, chunk]):
+					s.add(coalesced_chunk)
+			elif after in s:
+				for coalesced_chunk in self.coalesce([chunk, after]):
+					s.add(coalesced_chunk)
+			else:
+				s.add(chunk)
+				
 		del self.blob_map[key]
 
 

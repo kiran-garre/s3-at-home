@@ -1,7 +1,9 @@
 from storage0 import Storage0
 from storage1 import Storage1
 from storage2 import Storage2
-from storage3 import Storage3, Blob
+from storage3 import Storage3
+from storage4 import Storage4
+from blob import Blob
 
 import numpy as np
 import os
@@ -12,19 +14,22 @@ from storage_error import *
 
 # ----- Disk generation -----
 
-subprocess.run("bash create_disks.sh 4 > /dev/null 2>&1", shell=True)
+NUM_DISKS = 5
 
-disks = [f"disk{i}.bin" for i in range(4)]
+subprocess.run(f"bash create_disks.sh {NUM_DISKS} > /dev/null 2>&1", shell=True)
+
+disks = [f"disk{i}.bin" for i in range(NUM_DISKS)]
 
 # ----- Blob generation -----
 
 # We want the total size to be ~ DISK_RATIO * size of disk
 
-NUM_BLOBS = 5
+NUM_BLOBS = 10
 DISK_RATIO = 1.1
+disk_size = os.path.getsize(disks[0])
 sizes = np.random.randint(2**9, 2**19, NUM_BLOBS).astype(float)
-sizes *= (os.path.getsize(disks[0]) / sizes.sum()) * DISK_RATIO
-sizes = sizes.astype(int)
+sizes *= (disk_size / sizes.sum()) * DISK_RATIO
+sizes = list(map(int, sizes))
 
 blobs = [Blob(size, np.random.bytes(size)) for size in sizes]
 
@@ -37,15 +42,22 @@ print(*[f"Blob {i}: {blob.size}" for i, blob in enumerate(blobs)], sep="\n")
 
 OPERATIONS = ["insert", "fetch", "delete"]
 SEQUENCE_LENGTH = 10
+OUT_OF_SPACE_REJECT_RATE = 0.8
 
 def validate_sequence(sequence):
+	global disk_size
 	scope = set()
-	for operation, key, _ in sequence:
+	size = 0
+	for operation, key, blob in sequence:
 		match operation:
 			case "insert": 
 				if key in scope:
 					return False
 				scope.add(key)
+				size += blob.size
+				# Highly discourage "out of space" errors
+				if size > disk_size and np.random.rand() < OUT_OF_SPACE_REJECT_RATE:
+					return False
 			case "fetch":
 				if key not in scope: 
 					return False
@@ -53,6 +65,7 @@ def validate_sequence(sequence):
 				if key not in scope: 
 					return False
 				scope.remove(key)
+				size -= blob.size
 	return True
 
 while True:
@@ -103,9 +116,10 @@ def play(storage, sequence, name=""):
 				fetch(storage, key, blobs[key])
 			case "delete":
 				delete(storage, key)
+		# print(f"finished {operation}")
 	end = time.perf_counter_ns()
 	if name:
-		print(f"{name} succeeded in {format_ns(end - start)}!")
+		return f"{name} succeeded in {format_ns(end - start)}!"
 
 def format_ns(n):
 	if n >= 1_000_000:
@@ -116,18 +130,25 @@ def format_ns(n):
 		return f"{n} ns"
 
 storages = [
-	Storage0(disks[0]),
-	Storage1(disks[1]),
-	# Storage2(disks[2]),
-	# Storage3(disks[3]),
+	(Storage0(disks[0]), "Storage0"),
+	(Storage1(disks[1]), "Storage1"),
+	(Storage2(disks[2]), "Storage2"),
+	(Storage3(disks[3]), "Storage3"),
+	(Storage4(disks[4]), "Storage4"),
 ]
+np.random.shuffle(storages)
 
-for i, storage in enumerate(storages):
+results = []
+for i, (storage, name) in enumerate(storages):
 	try:
-		play(storage, valid_sequence, f"storage{i}")
-	except RuntimeError:
+		results.append(play(storage, valid_sequence, name))
+	except RuntimeError as e:
+		print(e)
 		continue
 			
+results.sort()
+print(*results, sep='\n')
+
 		
 
 

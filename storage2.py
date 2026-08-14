@@ -3,6 +3,7 @@ from collections import deque, defaultdict
 from typing import Self
 from dataclasses import dataclass
 from blob import Blob
+from storage_error import *
 
 """
 A block-based approach, where a single blob maps to one or more blocks. There
@@ -49,7 +50,6 @@ class Storage2:
 				tracked_space += size
 			threshold = THRESHOLD_PCT * (disk_size - tracked_space)
 
-	
 	def insert(self, key, blob):
 		if key in self.blob_map:
 			return
@@ -67,25 +67,33 @@ class Storage2:
 			while remaining > size and self.free_map[size]:
 				chunks.append(self.free_map[size].pop())
 				remaining -= size
-		if remaining:
+
+		if remaining > 0:
 			for size in self.CHUNK_SIZES:
-				if self.free_map[size]:
+				if size > remaining and self.free_map[size]:
 					chunks.append(self.free_map[size].pop())
-					self.write_chunks(blob, chunks)
-					self.blob_map[key] = (size, chunks)
-					return 0
-				print("Failed to insert object")
-				return 1
+					remaining -= size
+					break
+
+		# If there's still stuff remaining, that means we couldn't find a block
+		if remaining > 0:
+			return StorageError(OUT_OF_SPACE, "out of space")
+		
+		self.write_chunks(blob, chunks)
+		self.blob_map[key] = (blob.size, chunks)
+		return 
+				
 	
 	def write_chunks(self, blob: Blob, allocated_chunks: list[Chunk]):
 		for chunk in allocated_chunks:
 			data_chunk = blob.get_chunk(chunk.size)
 			self.handle.seek(chunk.offset)
 			self.handle.write(data_chunk)
+		blob.reset_chunk_generator()
 
 	def fetch(self, key) -> Blob:
-		if key not in self.chunk_map:
-			return None
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		read_chunks = []
 		size, disk_chunks = self.blob_map[key]
 		for disk_chunk in disk_chunks:
@@ -96,8 +104,8 @@ class Storage2:
 		return blob
 		
 	def delete(self, key):
-		if key not in self.chunk_map:
-			return
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		_, chunks = self.blob_map[key]
 		for chunk in chunks:
 			self.free_map[chunk.size].append(chunk)

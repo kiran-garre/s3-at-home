@@ -87,6 +87,8 @@ class Storage1:
 		return blob
 		
 	def delete(self, key):
+		if key not in self.blob_map:
+			return StorageError(KEY_NOT_FOUND, f"key: \"{key}\" not found")
 		for offset in self.blob_map[key][CHUNKS]:
 			self.free_list.append(offset)
 		del self.blob_map[key]
